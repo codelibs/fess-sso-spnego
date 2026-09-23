@@ -28,10 +28,12 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.codelibs.core.io.ResourceUtil;
 import org.codelibs.core.lang.StringUtil;
+import org.codelibs.fess.api.v2.handlers.LoginRateLimiter;
 import org.codelibs.fess.app.web.base.login.ActionResponseCredential;
 import org.codelibs.fess.app.web.base.login.FessLoginAssist.LoginCredentialResolver;
 import org.codelibs.fess.exception.SsoLoginException;
 import org.codelibs.fess.exception.SsoStateException;
+import org.codelibs.fess.mylasta.direction.FessConfig;
 import org.codelibs.fess.sso.SsoAuthenticator;
 import org.codelibs.fess.util.ComponentUtil;
 import org.codelibs.spnego.SpnegoFilterConfig;
@@ -39,6 +41,7 @@ import org.codelibs.spnego.SpnegoHttpFilter.Constants;
 import org.codelibs.spnego.SpnegoHttpServletResponse;
 import org.codelibs.spnego.SpnegoPrincipal;
 import org.dbflute.optional.OptionalEntity;
+import org.dbflute.optional.OptionalThing;
 import org.ietf.jgss.GSSException;
 import org.lastaflute.web.login.credential.LoginCredential;
 import org.lastaflute.web.servlet.filter.RequestLoggingFilter;
@@ -109,6 +112,9 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
 
     /** Upper bound on the length of a client-supplied value embedded in a log message. */
     protected static final int MAX_LOGGED_REALM_LENGTH = 64;
+
+    /** The longest Basic user name that is throttled rather than refused, as POST /api/v2/auth/login allows. */
+    protected static final int MAX_BASIC_USER_LENGTH = 100;
 
     /**
      * Characters that must not be copied verbatim into a log message. {@code \p{Cntrl}} alone is
@@ -239,6 +245,13 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
             // here, against the request. Doing it before authenticating also keeps a rejected realm
             // from causing an AS-REQ to a foreign KDC.
             rejectDisallowedBasicRealm(request);
+            // A Basic header is a password guess against the directory, made from an anonymous
+            // endpoint: throttle it the way POST /api/v2/auth/login is throttled, before the
+            // library turns it into a Kerberos AS-REQ.
+            final String basicUser = getBasicUserName(request.getHeader(Constants.AUTHZ_HEADER));
+            if (StringUtil.isNotEmpty(basicUser)) {
+                throttleBasicAttempt(request, basicUser);
+            }
 
             // client/caller principal
             final SpnegoPrincipal principal;
@@ -270,6 +283,12 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
                 logger.debug("isStatusSet={}", status);
             }
             if (status) {
+                if (StringUtil.isNotEmpty(basicUser)) {
+                    // With a Basic header the library answers 401 again when the Kerberos login
+                    // for that name failed. It does not say why, so a KDC that cannot be reached
+                    // counts as a refused password too, as it does for the LDAP form login.
+                    recordBasicFailure(request, basicUser);
+                }
                 // The library has already written and flushed the 401 with its WWW-Authenticate header,
                 // so this exception only unwinds the action. Log it at debug level to keep the normal
                 // SPNEGO handshake out of the application log.
@@ -297,9 +316,117 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
                 // trace per attempt would let an unauthenticated client fill the log.
                 throw new SsoStateException(realmRejectedMessage(username[1]));
             }
+            if (StringUtil.isNotEmpty(basicUser)) {
+                clearBasicThrottle(request, basicUser);
+            }
             return new SpnegoCredential(username[0]);
         }).orElse(null);
 
+    }
+
+    /**
+     * Refuses a Basic attempt once its client address or its (address, user name) pair has used up
+     * the login allowance, before any password reaches the KDC.
+     *
+     * The allowance and the lockout are those of {@code POST /api/v2/auth/login}
+     * ({@code theme.api.login.*}) and share its {@link LoginRateLimiter}, so a client cannot double
+     * its guesses by alternating the two endpoints. As there, the user bucket is keyed by address
+     * and name together, so nobody can lock a user out from another address, and only the request
+     * that arms a lockout is logged at warn level.
+     *
+     * @param request the current request
+     * @param user the user name the Basic header carries
+     * @throws SsoStateException if the attempt is refused
+     */
+    protected void throttleBasicAttempt(final HttpServletRequest request, final String user) {
+        if (user.length() > MAX_BASIC_USER_LENGTH) {
+            // The name keys the limiter, so it is bounded as POST /api/v2/auth/login bounds it.
+            throw new SsoStateException("Basic user name exceeds " + MAX_BASIC_USER_LENGTH + " characters.");
+        }
+        final LoginRateLimiter limiter = ComponentUtil.getLoginRateLimiter();
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        final int lockoutSec = fessConfig.getThemeApiLoginLockoutSecondsAsInteger();
+        final String clientIp = getClientIp(request);
+        if (!limiter.allow(LoginRateLimiter.Scope.IP, clientIp, fessConfig.getThemeApiLoginRateLimitPerIpPerMinuteAsInteger(), 60)) {
+            if (limiter.lockOut(LoginRateLimiter.Scope.IP, clientIp, lockoutSec)) {
+                logger.warn("Basic login rate limit exceeded; locking out for {}s: clientIp={}", lockoutSec, clientIp);
+            }
+            throw new SsoStateException("Too many Basic login attempts: clientIp=" + clientIp);
+        }
+        final String userKey = basicUserKey(clientIp, user);
+        if (!limiter.peek(LoginRateLimiter.Scope.USER, userKey, fessConfig.getThemeApiLoginRateLimitPerUserPerMinuteAsInteger(), 60)) {
+            if (limiter.lockOut(LoginRateLimiter.Scope.USER, userKey, lockoutSec)) {
+                logger.warn("Basic login rate limit exceeded; locking out for {}s: username={}, clientIp={}", lockoutSec,
+                        sanitizeForLog(user), clientIp);
+            }
+            throw new SsoStateException("Too many Basic login attempts: username=" + sanitizeForLog(user) + ", clientIp=" + clientIp);
+        }
+    }
+
+    /**
+     * Records a Basic password the directory refused: a {@code LOGIN_FAILURE} line in the audit log,
+     * as the login form writes, and one attempt against the (address, user name) allowance.
+     *
+     * @param request the current request
+     * @param user the user name the Basic header carries
+     */
+    protected void recordBasicFailure(final HttpServletRequest request, final String user) {
+        ComponentUtil.getActivityHelper().loginFailure(OptionalThing.of(new SpnegoCredential(sanitizeForLog(user))));
+        final LoginRateLimiter limiter = ComponentUtil.getLoginRateLimiter();
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        final String clientIp = getClientIp(request);
+        final String userKey = basicUserKey(clientIp, user);
+        if (!limiter.allow(LoginRateLimiter.Scope.USER, userKey, fessConfig.getThemeApiLoginRateLimitPerUserPerMinuteAsInteger(), 60)) {
+            final int lockoutSec = fessConfig.getThemeApiLoginLockoutSecondsAsInteger();
+            if (limiter.lockOut(LoginRateLimiter.Scope.USER, userKey, lockoutSec)) {
+                logger.warn("Basic login rate limit exhausted; locking out for {}s: username={}, clientIp={}", lockoutSec,
+                        sanitizeForLog(user), clientIp);
+            }
+        }
+    }
+
+    /**
+     * Forgets the attempts of a client whose Basic password was accepted, so a user who mistyped a
+     * few times is not held to them after logging in.
+     *
+     * @param request the current request
+     * @param user the user name the Basic header carries
+     */
+    protected void clearBasicThrottle(final HttpServletRequest request, final String user) {
+        try {
+            final LoginRateLimiter limiter = ComponentUtil.getLoginRateLimiter();
+            final String clientIp = getClientIp(request);
+            limiter.clear(LoginRateLimiter.Scope.USER, basicUserKey(clientIp, user));
+            limiter.clear(LoginRateLimiter.Scope.IP, clientIp);
+        } catch (final RuntimeException e) {
+            // The password has already been accepted; forgetting the counters must not fail the login.
+            logger.debug("Failed to clear the Basic login counters.", e);
+        }
+    }
+
+    /**
+     * Resolves the client address the allowance is counted against.
+     *
+     * @param request the current request
+     * @return the address {@code RateLimitHelper} resolves, or the remote address when it cannot
+     */
+    protected String getClientIp(final HttpServletRequest request) {
+        try {
+            return ComponentUtil.getRateLimitHelper().getClientIp(request);
+        } catch (final RuntimeException e) {
+            return request.getRemoteAddr();
+        }
+    }
+
+    /**
+     * Builds the user-scope key in the (address, user name) form the v2 login uses.
+     *
+     * @param clientIp the client address
+     * @param user the user name
+     * @return the key
+     */
+    protected static String basicUserKey(final String clientIp, final String user) {
+        return clientIp + '\0' + user;
     }
 
     /**
@@ -381,16 +508,16 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
     }
 
     /**
-     * Extracts the Kerberos realm from the user name of a Basic {@code Authorization} header.
+     * Extracts the user name of a Basic {@code Authorization} header, without a NetBIOS domain
+     * prefix, as the library will authenticate it.
      *
-     * Only the user name half of the decoded token is inspected. The password is never returned and
+     * Only the user name half of the decoded token is read. The password is never returned and
      * never logged.
      *
      * @param authzHeader the raw Authorization header value (may be null)
-     * @return the realm the client typed, or null when the header is not Basic, cannot be decoded,
-     *         or names no realm
+     * @return the user name, or null when the header is not Basic or cannot be decoded
      */
-    protected static String getBasicRealm(final String authzHeader) {
+    protected static String getBasicUserName(final String authzHeader) {
         if (authzHeader == null) {
             return null;
         }
@@ -426,7 +553,24 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
         final int colon = credentials.indexOf(':');
         final String user = colon < 0 ? credentials : credentials.substring(0, colon);
         // The library drops a NetBIOS "DOMAIN\" prefix before authenticating, so mirror it here.
-        final String name = user.substring(user.indexOf('\\') + 1);
+        return user.substring(user.indexOf('\\') + 1);
+    }
+
+    /**
+     * Extracts the Kerberos realm from the user name of a Basic {@code Authorization} header.
+     *
+     * Only the user name half of the decoded token is inspected. The password is never returned and
+     * never logged.
+     *
+     * @param authzHeader the raw Authorization header value (may be null)
+     * @return the realm the client typed, or null when the header is not Basic, cannot be decoded,
+     *         or names no realm
+     */
+    protected static String getBasicRealm(final String authzHeader) {
+        final String name = getBasicUserName(authzHeader);
+        if (name == null) {
+            return null;
+        }
         // Kerberos reads the realm after the last '@', not the first: KerberosPrincipal collapses
         // "alice@a@PARTNER.EXAMPLE" to name "alice@PARTNER.EXAMPLE" in realm "PARTNER.EXAMPLE", and
         // the library hands the typed name straight to the login module, so PARTNER.EXAMPLE is the

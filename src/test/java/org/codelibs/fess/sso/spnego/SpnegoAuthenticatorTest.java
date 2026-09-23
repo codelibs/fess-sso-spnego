@@ -22,17 +22,24 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.codelibs.core.misc.DynamicProperties;
+import org.codelibs.fess.api.v2.handlers.LoginRateLimiter;
 import org.codelibs.fess.exception.SsoLoginException;
 import org.codelibs.fess.exception.SsoStateException;
+import org.codelibs.fess.helper.ActivityHelper;
+import org.codelibs.fess.mylasta.direction.FessConfig;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.codelibs.spnego.SpnegoHttpFilter.Constants;
 import org.codelibs.spnego.SpnegoProvider;
+import org.dbflute.optional.OptionalThing;
 import org.ietf.jgss.GSSException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
+import org.lastaflute.web.login.credential.LoginCredential;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -173,6 +180,134 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
         assertNull(SpnegoAuthenticator.getBasicRealm("Basic\t"));
         assertNull(SpnegoAuthenticator.getBasicRealm(""));
         assertNull(SpnegoAuthenticator.getBasicRealm("Basi"));
+    }
+
+    @Test
+    public void test_getBasicUserName() {
+        assertEquals("alice", SpnegoAuthenticator.getBasicUserName(basic("alice:secret")));
+        assertEquals("alice", SpnegoAuthenticator.getBasicUserName(basic("CORP\\alice:secret")));
+        assertEquals("alice@PARTNER.EXAMPLE", SpnegoAuthenticator.getBasicUserName(basic("alice@PARTNER.EXAMPLE:secret")));
+        assertEquals("alice", SpnegoAuthenticator.getBasicUserName("basic\t" + token("alice:secret")));
+        assertNull(SpnegoAuthenticator.getBasicUserName(null));
+        assertNull(SpnegoAuthenticator.getBasicUserName("Negotiate YIIFoAYGKwYBBQUCoIIF"));
+        assertNull(SpnegoAuthenticator.getBasicUserName("Basic"));
+        assertNull(SpnegoAuthenticator.getBasicUserName("Basic !!!not-base64!!!"));
+    }
+
+    /** Wires the limiter, its thresholds and a recording audit helper the Basic throttle reads. */
+    private List<String> wireBasicThrottle(final int perIp, final int perUser) {
+        ComponentUtil.register(new LoginRateLimiter(), "loginRateLimiter");
+        ComponentUtil.setFessConfig(new FessConfig.SimpleImpl() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public Integer getThemeApiLoginRateLimitPerIpPerMinuteAsInteger() {
+                return perIp;
+            }
+
+            @Override
+            public Integer getThemeApiLoginRateLimitPerUserPerMinuteAsInteger() {
+                return perUser;
+            }
+
+            @Override
+            public Integer getThemeApiLoginLockoutSecondsAsInteger() {
+                return 900;
+            }
+        });
+        final List<String> failures = new CopyOnWriteArrayList<>();
+        ComponentUtil.register(new ActivityHelper() {
+            @Override
+            public void loginFailure(final OptionalThing<LoginCredential> credential) {
+                failures.add(credential.map(c -> ((SpnegoCredential) c).getUserId()).orElse("-"));
+            }
+        }, "activityHelper");
+        return failures;
+    }
+
+    private static SpnegoAuthenticator authenticatorFrom(final String clientIp) {
+        return new SpnegoAuthenticator() {
+            @Override
+            protected String getClientIp(final HttpServletRequest request) {
+                return clientIp;
+            }
+        };
+    }
+
+    @Test
+    public void test_basicFailure_isAuditedAndCountedAgainstTheUser() {
+        final List<String> failures = wireBasicThrottle(100, 2);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.1");
+            final HttpServletRequest request = requestWithAuthz(basic("carol:wrong"));
+            authenticator.throttleBasicAttempt(request, "carol");
+            authenticator.recordBasicFailure(request, "carol");
+            authenticator.throttleBasicAttempt(request, "carol");
+            authenticator.recordBasicFailure(request, "carol");
+            assertEquals(List.of("carol", "carol"), failures);
+            // The allowance is used up: the third guess never reaches the KDC.
+            final SsoStateException e = assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol"));
+            assertFalse(e.getMessage().contains("wrong"));
+            // Another user from the same address, and the same user from another address, are unaffected.
+            authenticator.throttleBasicAttempt(request, "dave");
+            authenticatorFrom("192.0.2.2").throttleBasicAttempt(request, "carol");
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicAttempts_areBoundedPerAddress() {
+        wireBasicThrottle(3, 100);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.3");
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            for (int i = 0; i < 3; i++) {
+                authenticator.throttleBasicAttempt(request, "user" + i);
+            }
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "user9"));
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicAttempt_withAnOverlongNameIsRefused() {
+        wireBasicThrottle(100, 100);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.6");
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            authenticator.throttleBasicAttempt(request, "a".repeat(100));
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "a".repeat(101)));
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicSuccess_clearsTheAllowance() {
+        wireBasicThrottle(100, 1);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.4");
+            final HttpServletRequest request = requestWithAuthz(basic("carol:x"));
+            authenticator.recordBasicFailure(request, "carol");
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol"));
+            authenticator.clearBasicThrottle(request, "carol");
+            authenticator.throttleBasicAttempt(request, "carol");
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicFailure_recordsASanitizedName() {
+        final List<String> failures = wireBasicThrottle(100, 100);
+        try {
+            authenticatorFrom("192.0.2.5").recordBasicFailure(requestWithAuthz(null), "x" + ch(10) + "action:LOGIN");
+            assertEquals(List.of("x?action:LOGIN"), failures);
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
     }
 
     @Test
