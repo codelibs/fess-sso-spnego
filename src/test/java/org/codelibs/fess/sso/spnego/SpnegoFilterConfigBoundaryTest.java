@@ -16,7 +16,6 @@
 package org.codelibs.fess.sso.spnego;
 
 import java.io.File;
-import java.lang.reflect.Field;
 
 import javax.security.auth.login.Configuration;
 
@@ -44,16 +43,17 @@ import org.junit.jupiter.api.TestInfo;
  *
  * <p>
  * This test crosses the boundary on purpose: it feeds a real {@link SpnegoAuthenticator.SpnegoConfig}
- * into {@link SpnegoFilterConfig#getInstance(jakarta.servlet.FilterConfig)} with JAAS fixtures under
+ * into {@link SpnegoFilterConfig#newInstance(jakarta.servlet.FilterConfig)}, the factory
+ * {@link SpnegoAuthenticator#createAuthenticator(SpnegoAuthenticator.SpnegoConfig)} uses, with JAAS fixtures under
  * {@code src/test/resources/spnego/} and asserts the resulting configuration. The first method pins
  * the plain-path contract that broke; the second pins that a {@code file:} URI is still accepted, so
  * the library fix cannot later be "simplified" into a path-only parser.
  * </p>
  *
  * <p>
- * The whole Fess suite shares one JVM, and both {@code SpnegoFilterConfig} and
- * {@link Configuration} are JVM-wide cached singletons, so this class saves and restores that global
- * state itself rather than relying on any other test to leave it clean.
+ * The whole Fess suite shares one JVM, and {@link Configuration} and the system properties the
+ * library sets are JVM-wide, so this class saves and restores that global state itself rather than
+ * relying on any other test to leave it clean.
  * </p>
  */
 public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
@@ -76,9 +76,6 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
     /** JVM system property the library sets from the krb5.conf init parameter. */
     private static final String KRB5_CONFIG_PROPERTY = "java.security.krb5.conf";
 
-    /** The library singleton captured before the test replaced it. */
-    private Object savedFilterConfigInstance;
-
     /** The JAAS configuration captured before the test forced a reload. */
     private Configuration savedJaasConfiguration;
 
@@ -92,16 +89,9 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
     protected void setUp(final TestInfo testInfo) throws Exception {
         super.setUp(testInfo);
 
-        // SpnegoFilterConfig caches its instance in a private static field and offers no reset, so
-        // the constructor under test would never run a second time in this JVM.
-        final Field instanceField = getInstanceField();
-        savedFilterConfigInstance = instanceField.get(null);
-        instanceField.set(null, null);
-
-        // Configuration is a JVM-wide cached singleton that reads java.security.auth.login.config
-        // only on first use. If an earlier test touched JAAS, the library's module lookup would see
-        // a stale configuration and fail with "The client module name was not found in the login
-        // file". Clearing it forces a reload from the property the library is about to set.
+        // Configuration is a JVM-wide cached singleton. newInstance() refreshes it, but a refresh
+        // only rereads the file when it is the JDK's file based one, so drop whatever an earlier
+        // test may have installed.
         try {
             savedJaasConfiguration = Configuration.getConfiguration();
         } catch (final Exception | Error e) {
@@ -128,28 +118,9 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
             restoreSystemProperty(KRB5_CONFIG_PROPERTY, savedKrb5ConfigProperty);
 
             Configuration.setConfiguration(savedJaasConfiguration);
-
-            getInstanceField().set(null, savedFilterConfigInstance);
         } finally {
             super.tearDown(testInfo);
         }
-    }
-
-    /**
-     * Returns the library's private static singleton field, made accessible.
-     *
-     * <p>
-     * The field lives on a class loaded from the classpath (unnamed module), so no
-     * {@code --add-opens} is required.
-     * </p>
-     *
-     * @return the accessible {@code SpnegoFilterConfig.instance} field
-     * @throws Exception if the field no longer exists
-     */
-    private static Field getInstanceField() throws Exception {
-        final Field field = SpnegoFilterConfig.class.getDeclaredField("instance");
-        field.setAccessible(true);
-        return field;
     }
 
     /**
@@ -172,7 +143,7 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
      * @throws Exception if the library rejects the configuration
      */
     @Test
-    public void test_getInstance_acceptsPlainAbsolutePathFromClasspath() throws Exception {
+    public void test_newInstance_acceptsPlainAbsolutePathFromClasspath() throws Exception {
         final SpnegoAuthenticator.SpnegoConfig config = new SpnegoAuthenticator.SpnegoConfig();
 
         // Contract: Fess hands the library a plain absolute path, not a file: URI. Pinning this
@@ -182,7 +153,7 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
         assertTrue(new File(loginConf).isAbsolute());
 
         // The boundary: this constructor is what the regression broke.
-        final SpnegoFilterConfig result = SpnegoFilterConfig.getInstance(config);
+        final SpnegoFilterConfig result = SpnegoFilterConfig.newInstance(config);
         assertNotNull(result);
 
         // toString() is the only public view of the parsed state.
@@ -204,7 +175,7 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
      * @throws Exception if the library rejects the configuration
      */
     @Test
-    public void test_getInstance_alsoAcceptsFileUri() throws Exception {
+    public void test_newInstance_alsoAcceptsFileUri() throws Exception {
         final SpnegoAuthenticator.SpnegoConfig config = new SpnegoAuthenticator.SpnegoConfig() {
             @Override
             protected String getResourcePath(final String path) {
@@ -215,7 +186,7 @@ public class SpnegoFilterConfigBoundaryTest extends UnitFessTestCase {
         final String loginConf = config.getInitParameter(Constants.LOGIN_CONF);
         assertTrue(loginConf.startsWith("file:"));
 
-        final SpnegoFilterConfig result = SpnegoFilterConfig.getInstance(config);
+        final SpnegoFilterConfig result = SpnegoFilterConfig.newInstance(config);
         assertNotNull(result);
 
         final String s = result.toString();

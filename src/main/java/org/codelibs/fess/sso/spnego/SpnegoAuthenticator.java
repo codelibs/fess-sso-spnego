@@ -21,6 +21,9 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -28,6 +31,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.codelibs.core.io.ResourceUtil;
 import org.codelibs.core.lang.StringUtil;
+import org.codelibs.core.misc.DynamicProperties;
 import org.codelibs.fess.api.v2.handlers.LoginRateLimiter;
 import org.codelibs.fess.app.web.base.login.ActionResponseCredential;
 import org.codelibs.fess.app.web.base.login.FessLoginAssist.LoginCredentialResolver;
@@ -110,6 +114,14 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
     /** Configuration key for SPNEGO logger level. */
     protected static final String SPNEGO_LOGGER_LEVEL = "spnego.logger.level";
 
+    /**
+     * The keys the library authenticator is built from. A change to any of them rebuilds it;
+     * {@value #SPNEGO_ALLOWED_REALMS} is not listed because it is read on every login.
+     */
+    protected static final List<String> AUTHENTICATOR_SETTING_KEYS = List.of(SPNEGO_KRB5_CONF, SPNEGO_LOGIN_CONF,
+            SPNEGO_LOGIN_CLIENT_MODULE, SPNEGO_LOGIN_SERVER_MODULE, SPNEGO_PREAUTH_USERNAME, SPNEGO_PREAUTH_PASSWORD, SPNEGO_ALLOW_BASIC,
+            SPNEGO_ALLOW_UNSECURE_BASIC, SPNEGO_PROMPT_NTLM, SPNEGO_ALLOW_LOCALHOST, SPNEGO_ALLOW_DELEGATION, SPNEGO_LOGGER_LEVEL);
+
     /** Upper bound on the length of a client-supplied value embedded in a log message. */
     protected static final int MAX_LOGGED_REALM_LENGTH = 64;
 
@@ -125,6 +137,13 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
 
     /** The underlying SPNEGO authenticator instance. */
     protected volatile org.codelibs.spnego.SpnegoAuthenticator authenticator = null;
+
+    /**
+     * The settings {@link #authenticator} was built from. It is written before
+     * {@link #authenticator} and read before it, so a reader that sees these settings sees the
+     * matching authenticator or a newer one.
+     */
+    protected volatile Map<String, String> authenticatorSettings = null;
 
     /**
      * Constructs a new SPNEGO authenticator.
@@ -152,50 +171,107 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
     public synchronized void destroy() {
         if (authenticator != null) {
             try {
-                authenticator.dispose();
-            } catch (final Exception e) {
-                logger.warn("Failed to dispose SPNEGO authenticator.", e);
+                disposeAuthenticator(authenticator);
             } finally {
                 authenticator = null;
+                authenticatorSettings = null;
             }
         }
     }
 
     /**
-     * Gets or creates the SPNEGO authenticator instance.
+     * Gets the SPNEGO authenticator, building it on first use and rebuilding it whenever one of
+     * the {@link #AUTHENTICATOR_SETTING_KEYS} has changed since it was built.
      *
-     * This method implements lazy initialization with synchronization to ensure
-     * the authenticator is only created once per JVM. Because the underlying
-     * SpnegoFilterConfig is a JVM-wide singleton, the configuration is cached for
-     * the lifetime of the process and a Fess restart is required to apply changes.
+     * The settings are read from the system properties on every call, which reload
+     * {@code system.properties} when the file changes, so a save on the administration screen or a
+     * hand edit of the file takes effect on the next login without a restart. The old authenticator
+     * is disposed of once the settings change, so a handshake still running on it may fail and has
+     * to be retried by the client. A rebuild that fails leaves no authenticator behind: the old
+     * one no longer matches the settings, and the JVM-wide Kerberos and JAAS configuration it
+     * depends on now points at the new files. The next login tries again.
+     *
+     * Only the keys are compared. A change to the content of krb5.conf, the login configuration or
+     * a keytab that leaves every key as it was is not detected and still needs a restart.
      *
      * @return The configured SPNEGO authenticator instance
      * @throws SsoLoginException if SPNEGO initialization fails
      */
     protected org.codelibs.spnego.SpnegoAuthenticator getAuthenticator() {
+        final Map<String, String> settings = getAuthenticatorSettings();
+        // Settings first: see authenticatorSettings.
+        final Map<String, String> currentSettings = authenticatorSettings;
         final org.codelibs.spnego.SpnegoAuthenticator current = authenticator;
-        if (current != null) {
+        if (current != null && settings.equals(currentSettings)) {
             return current;
         }
         synchronized (this) {
             if (authenticator != null) {
-                return authenticator;
+                if (settings.equals(authenticatorSettings)) {
+                    return authenticator;
+                }
+                logger.info("SPNEGO settings have changed. Reinitializing SPNEGO.");
+                destroy();
             }
             try {
-                // NOTE: The underlying SpnegoFilterConfig is a JVM-wide singleton, so the SPNEGO
-                // configuration is effectively cached for the lifetime of the process. Changes to the
-                // spnego.* settings therefore require a Fess restart to take effect.
                 final SpnegoConfig spnegoConfig = new SpnegoConfig();
-                final SpnegoFilterConfig config = SpnegoFilterConfig.getInstance(spnegoConfig);
-                authenticator = new org.codelibs.spnego.SpnegoAuthenticator(config);
+                final org.codelibs.spnego.SpnegoAuthenticator created = createAuthenticator(spnegoConfig);
+                authenticatorSettings = settings;
+                authenticator = created;
                 // Warn only once initialization has succeeded. A failed attempt leaves authenticator
                 // null and is retried on the next login, so warning before this point repeats the
                 // same message for every attempt, and the settings cannot matter until SPNEGO runs.
                 warnInsecureSettings(spnegoConfig);
-                return authenticator;
+                return created;
             } catch (final Exception e) {
                 throw new SsoLoginException("Failed to initialize SPNEGO.", e);
             }
+        }
+    }
+
+    /**
+     * Reads the current values of the {@link #AUTHENTICATOR_SETTING_KEYS}.
+     *
+     * A blank value is recorded as empty, as {@link SpnegoConfig#getProperty(String, String)}
+     * treats it as unset either way.
+     *
+     * @return the values by key
+     */
+    protected Map<String, String> getAuthenticatorSettings() {
+        final DynamicProperties systemProperties = ComponentUtil.getSystemProperties();
+        final Map<String, String> settings = new LinkedHashMap<>();
+        for (final String key : AUTHENTICATOR_SETTING_KEYS) {
+            final String value = systemProperties.getProperty(key);
+            settings.put(key, StringUtil.isBlank(value) ? StringUtil.EMPTY : value);
+        }
+        return settings;
+    }
+
+    /**
+     * Builds a library authenticator from the given configuration.
+     *
+     * {@link SpnegoFilterConfig#newInstance(FilterConfig)} parses the configuration on every call,
+     * unlike the JVM-wide singleton behind {@code getInstance}, and reloads the JAAS login
+     * configuration and the Kerberos configuration the files name.
+     *
+     * @param config the SPNEGO configuration built from the current settings
+     * @return a new library authenticator, logged in to the KDC
+     * @throws Exception if the configuration is invalid or the server login fails
+     */
+    protected org.codelibs.spnego.SpnegoAuthenticator createAuthenticator(final SpnegoConfig config) throws Exception {
+        return new org.codelibs.spnego.SpnegoAuthenticator(SpnegoFilterConfig.newInstance(config));
+    }
+
+    /**
+     * Releases the server credential and the login context of a library authenticator.
+     *
+     * @param target the authenticator to dispose of
+     */
+    protected void disposeAuthenticator(final org.codelibs.spnego.SpnegoAuthenticator target) {
+        try {
+            target.dispose();
+        } catch (final Exception e) {
+            logger.warn("Failed to dispose SPNEGO authenticator.", e);
         }
     }
 

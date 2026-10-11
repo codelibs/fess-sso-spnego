@@ -67,10 +67,14 @@ Six things are worth knowing before the first login:
   classpath resources, so the files go in `app/WEB-INF/classes/`. They are not shipped: a missing
   one fails the login with "SPNEGO configuration file not found", not the startup, because SPNEGO
   is initialized on the first login rather than at boot.
-* **Every `spnego.*` change needs a restart.** The library keeps its parsed configuration in a
-  JVM-wide singleton (`SpnegoFilterConfig`) and Fess builds it once, so nothing read here is
-  revisited for the lifetime of the process. The same applies to the server credential: restart
-  after the service account password is changed in AD or the keytab is replaced.
+* **A `spnego.*` change takes effect on the next login, without a restart.** Every login compares
+  the keys above with the values SPNEGO was initialized from, and a difference rebuilds it: the
+  JAAS login configuration and `krb5.conf` are read again and the server logs in to the KDC anew.
+  This holds for a save on the administration screen and for a hand edit of `system.properties`.
+  Only the keys are compared, though: replacing a keytab, or editing `krb5.conf` or the login
+  configuration in place while every key stays the same, still needs a restart, and so does a
+  service account password changed in AD but not here. A handshake that is in progress while
+  SPNEGO is rebuilt can fail once; the browser simply tries again.
 * **A keytab is used only when both pre-authentication fields are empty.** That is why clearing
   the password field on the administration screen *removes* the key instead of storing an empty
   string, which is how a keytab configuration stays reachable once a password has been saved. With
