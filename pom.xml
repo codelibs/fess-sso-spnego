@@ -19,7 +19,7 @@
 		<relativePath />
 	</parent>
 	<properties>
-		<spnego.version>1.2.2</spnego.version>
+		<spnego.version>1.2.3</spnego.version>
 	</properties>
 	<build>
 		<plugins>
