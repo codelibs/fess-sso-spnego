@@ -347,19 +347,22 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
         final FessConfig fessConfig = ComponentUtil.getFessConfig();
         final int lockoutSec = fessConfig.getThemeApiLoginLockoutSecondsAsInteger();
         final String clientIp = getClientIp(request);
+        // The raw address keys the limiter; only the text shown in a message or a log is sanitized,
+        // as a trusted proxy's X-Real-IP header is passed on as the client sent it.
+        final String shownIp = sanitizeForLog(clientIp);
         if (!limiter.allow(LoginRateLimiter.Scope.IP, clientIp, fessConfig.getThemeApiLoginRateLimitPerIpPerMinuteAsInteger(), 60)) {
             if (limiter.lockOut(LoginRateLimiter.Scope.IP, clientIp, lockoutSec)) {
-                logger.warn("Basic login rate limit exceeded; locking out for {}s: clientIp={}", lockoutSec, clientIp);
+                logger.warn("Basic login rate limit exceeded; locking out for {}s: clientIp={}", lockoutSec, shownIp);
             }
-            throw new SsoStateException("Too many Basic login attempts: clientIp=" + clientIp);
+            throw new SsoStateException("Too many Basic login attempts: clientIp=" + shownIp);
         }
         final String userKey = basicUserKey(clientIp, user);
         if (!limiter.peek(LoginRateLimiter.Scope.USER, userKey, fessConfig.getThemeApiLoginRateLimitPerUserPerMinuteAsInteger(), 60)) {
             if (limiter.lockOut(LoginRateLimiter.Scope.USER, userKey, lockoutSec)) {
                 logger.warn("Basic login rate limit exceeded; locking out for {}s: username={}, clientIp={}", lockoutSec,
-                        sanitizeForLog(user), clientIp);
+                        sanitizeForLog(user), shownIp);
             }
-            throw new SsoStateException("Too many Basic login attempts: username=" + sanitizeForLog(user) + ", clientIp=" + clientIp);
+            throw new SsoStateException("Too many Basic login attempts: username=" + sanitizeForLog(user) + ", clientIp=" + shownIp);
         }
     }
 
@@ -380,7 +383,7 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
             final int lockoutSec = fessConfig.getThemeApiLoginLockoutSecondsAsInteger();
             if (limiter.lockOut(LoginRateLimiter.Scope.USER, userKey, lockoutSec)) {
                 logger.warn("Basic login rate limit exhausted; locking out for {}s: username={}, clientIp={}", lockoutSec,
-                        sanitizeForLog(user), clientIp);
+                        sanitizeForLog(user), sanitizeForLog(clientIp));
             }
         }
     }
