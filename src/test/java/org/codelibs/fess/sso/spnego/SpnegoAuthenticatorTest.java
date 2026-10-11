@@ -31,6 +31,7 @@ import org.codelibs.fess.exception.SsoLoginException;
 import org.codelibs.fess.exception.SsoStateException;
 import org.codelibs.fess.helper.ActivityHelper;
 import org.codelibs.fess.mylasta.direction.FessConfig;
+import org.codelibs.fess.unit.LogCapturingAppender;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.codelibs.spnego.SpnegoHttpFilter.Constants;
@@ -294,6 +295,101 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
             assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol"));
             authenticator.clearBasicThrottle(request, "carol");
             authenticator.throttleBasicAttempt(request, "carol");
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    /**
+     * What RateLimitHelper#getClientIp returns for a trusted proxy that forwards an X-Real-IP header
+     * as it received it: trimmed, not validated, so it can hold line breaks and be arbitrarily long.
+     */
+    private static final String FORGED_CLIENT_IP =
+            "192.0.2.9" + ch(13) + ch(10) + "WARN forged line" + ch(0x0085) + ch(0x2028) + ch(0x2029) + "end" + "A".repeat(5000);
+
+    private void assertSafeForLog(final String text) {
+        assertNotNull(text);
+        for (final char c : text.toCharArray()) {
+            assertFalse("control or line-break character U+" + Integer.toHexString(c) + " in: " + text,
+                    Character.isISOControl(c) || c == '\u2028' || c == '\u2029');
+        }
+        // the client address, the user name and the realm are each bounded to MAX_LOGGED_REALM_LENGTH
+        assertTrue("text of " + text.length() + " characters is not bounded", text.length() <= 400);
+    }
+
+    @Test
+    public void test_basicThrottle_sanitizesTheClientAddressInTheIpRefusal() {
+        wireBasicThrottle(1, 100);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SpnegoAuthenticator.class);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom(FORGED_CLIENT_IP);
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            authenticator.throttleBasicAttempt(request, "carol");
+            final SsoStateException e = assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol"));
+
+            assertTrue(e.getMessage(), e.getMessage().contains("WARN forged line"));
+            assertSafeForLog(e.getMessage());
+            assertEquals(1, appender.warnings().size(), String.valueOf(appender.warnings()));
+            assertTrue(appender.warnings().get(0), appender.warnings().get(0).contains("WARN forged line"));
+            assertSafeForLog(appender.warnings().get(0));
+        } finally {
+            appender.detach();
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicThrottle_sanitizesTheClientAddressInTheUserRefusal() {
+        wireBasicThrottle(100, 1);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SpnegoAuthenticator.class);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom(FORGED_CLIENT_IP);
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            authenticator.recordBasicFailure(request, "carol");
+            final SsoStateException e = assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol"));
+
+            assertTrue(e.getMessage(), e.getMessage().contains("WARN forged line"));
+            assertSafeForLog(e.getMessage());
+            assertEquals(1, appender.warnings().size(), String.valueOf(appender.warnings()));
+            assertTrue(appender.warnings().get(0), appender.warnings().get(0).contains("WARN forged line"));
+            assertSafeForLog(appender.warnings().get(0));
+        } finally {
+            appender.detach();
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicFailure_sanitizesTheClientAddressWhenTheAllowanceIsExhausted() {
+        wireBasicThrottle(100, 1);
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SpnegoAuthenticator.class);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom(FORGED_CLIENT_IP);
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            authenticator.recordBasicFailure(request, "carol");
+            authenticator.recordBasicFailure(request, "carol");
+
+            assertEquals(1, appender.warnings().size(), String.valueOf(appender.warnings()));
+            assertTrue(appender.warnings().get(0), appender.warnings().get(0).contains("WARN forged line"));
+            assertSafeForLog(appender.warnings().get(0));
+        } finally {
+            appender.detach();
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
+    public void test_basicThrottle_keysTheLimiterOnTheRawClientAddress() {
+        // Sanitizing the address for display must not reach the limiter key: two addresses that
+        // differ only after the displayed prefix, or only in a replaced character, are two callers.
+        wireBasicThrottle(1, 100);
+        try {
+            final String first = FORGED_CLIENT_IP + "1";
+            final String second = FORGED_CLIENT_IP + "2";
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            authenticatorFrom(first).throttleBasicAttempt(request, "carol");
+            authenticatorFrom(second).throttleBasicAttempt(request, "carol");
+            assertThrows(SsoStateException.class, () -> authenticatorFrom(first).throttleBasicAttempt(request, "carol"));
         } finally {
             ComponentUtil.setFessConfig(null);
         }
