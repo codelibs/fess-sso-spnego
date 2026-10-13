@@ -466,7 +466,9 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
 
     /**
      * Forgets the attempts of a client whose Basic password was accepted, so a user who mistyped a
-     * few times is not held to them after logging in.
+     * few times is not held to them after logging in. Only the (address, user) bucket is cleared: the
+     * address bucket gives back just the slot this login took, because clearing it would let anyone
+     * who holds one valid account reset the allowance for the guesses made at other accounts.
      *
      * @param request the current request
      * @param user the user name the Basic header carries
@@ -476,7 +478,7 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
             final LoginRateLimiter limiter = ComponentUtil.getLoginRateLimiter();
             final String clientIp = getClientIp(request);
             limiter.clear(LoginRateLimiter.Scope.USER, basicUserKey(clientIp, user));
-            limiter.clear(LoginRateLimiter.Scope.IP, clientIp);
+            limiter.release(LoginRateLimiter.Scope.IP, clientIp);
         } catch (final RuntimeException e) {
             // The password has already been accepted; forgetting the counters must not fail the login.
             logger.debug("Failed to clear the Basic login counters.", e);
