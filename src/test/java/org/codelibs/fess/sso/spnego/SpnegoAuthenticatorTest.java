@@ -301,6 +301,36 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
         }
     }
 
+    @Test
+    public void test_basicSuccess_doesNotResetTheAddressAllowanceForGuessesAtOthers() {
+        wireBasicThrottle(10, 100);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.7");
+            final HttpServletRequest request = requestWithAuthz(basic("x:y"));
+            int guessesAnswered = 0;
+            // Nine wrong guesses at nine accounts, then one correct login that clears the throttle, three times over.
+            for (int round = 0; round < 3; round++) {
+                for (int i = 0; i < 9; i++) {
+                    try {
+                        authenticator.throttleBasicAttempt(request, "victim" + round + "-" + i);
+                        guessesAnswered++;
+                    } catch (final SsoStateException refused) {
+                        // refused before the directory is asked
+                    }
+                }
+                try {
+                    authenticator.throttleBasicAttempt(request, "attacker");
+                    authenticator.clearBasicThrottle(request, "attacker");
+                } catch (final SsoStateException refused) {
+                    // the address allowance is already used up
+                }
+            }
+            assertTrue("at most the per-minute allowance of 10 may reach the directory, got " + guessesAnswered, guessesAnswered <= 10);
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
     /**
      * What RateLimitHelper#getClientIp returns for a trusted proxy that forwards an X-Real-IP header
      * as it received it: trimmed, not validated, so it can hold line breaks and be arbitrarily long.
