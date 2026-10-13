@@ -29,7 +29,7 @@ import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
 
 import org.codelibs.core.misc.DynamicProperties;
-import org.codelibs.fess.exception.SsoLoginException;
+import org.codelibs.fess.exception.SsoStateException;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.junit.jupiter.api.Test;
@@ -174,7 +174,9 @@ public class SpnegoAuthenticatorReloadTest extends UnitFessTestCase {
         final org.codelibs.spnego.SpnegoAuthenticator first = authenticator.getAuthenticator();
 
         ComponentUtil.getSystemProperties().setProperty(SpnegoAuthenticator.SPNEGO_LOGIN_SERVER_MODULE, "no-such-module");
-        final SsoLoginException e = assertThrows(SsoLoginException.class, authenticator::getAuthenticator);
+        // A one-line refusal that still names the cause; the trace stays with the cause for debug logging.
+        final SsoStateException e = assertThrows(SsoStateException.class, authenticator::getAuthenticator);
+        assertTrue(e.getMessage().contains("no-such-module"));
         assertTrue(e.getCause().getMessage().contains("no-such-module"));
         // The old authenticator no longer matches the settings, so it must not keep serving logins.
         assertEquals(List.of(first), authenticator.disposed);

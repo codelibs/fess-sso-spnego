@@ -15,6 +15,7 @@
  */
 package org.codelibs.fess.sso.spnego;
 
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.lang.reflect.InvocationTargetException;
@@ -496,25 +497,20 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getLoginCredential_initializationFaultKeepsItsStackTrace() {
-        // The boundary the case above must not cross, and the reason it tests the thrown type
-        // rather than the cause chain. SpnegoFilterConfig raises UnsupportedOperationException for
-        // an invalid login module too -- no storeKey, a login module class it does not support, a
-        // control flag other than REQUIRED -- and those are server-side faults the operator needs
-        // the trace for. They are harmless here only because getAuthenticator() has already wrapped
-        // them in a plain SsoLoginException, so the thrown type is no longer the one being matched.
-        // Matching on the cause instead would find the nested UnsupportedOperationException and
-        // silently demote every initialization failure to a message-only log; this goes red first.
+    public void test_getLoginCredential_initializationFailureIsPassedOnAsOneLineRefusal() {
+        // /sso is anonymous and a broken setting makes every request repeat the failed build, so
+        // the failure must reach SsoAction as the SsoStateException it logs as a single line, not
+        // wrapped again in a plain SsoLoginException, which it logs with a stack trace.
         addMockRequestHeader(Constants.AUTHZ_HEADER, "Negotiate YIIFoAYGKwYBBQUCoIIF");
+        final SsoStateException failure = new SsoStateException("Failed to initialize SPNEGO: x",
+                new UnsupportedOperationException("Login Module for server does not have the storeKey option."));
         final SpnegoAuthenticator authenticator = new SpnegoAuthenticator() {
             @Override
             protected org.codelibs.spnego.SpnegoAuthenticator getAuthenticator() {
-                throw new SsoLoginException("Failed to initialize SPNEGO.",
-                        new UnsupportedOperationException("Login Module for server does not have the storeKey option."));
+                throw failure;
             }
         };
-        final SsoLoginException e = assertThrows(SsoLoginException.class, authenticator::getLoginCredential);
-        assertFalse(e instanceof SsoStateException);
+        assertSame(failure, assertThrows(SsoStateException.class, authenticator::getLoginCredential));
     }
 
     /**
@@ -587,27 +583,6 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
         final SsoStateException e = assertThrows(SsoStateException.class, authenticator::getLoginCredential);
         assertTrue(e.getMessage().contains("Illegal base64 character 23"));
         assertTrue(e.getMessage().contains("Negotiate ***"));
-    }
-
-    @Test
-    public void test_getLoginCredential_initializationFaultWithAnIllegalArgumentCauseKeepsItsStackTrace() {
-        // The same boundary as the UnsupportedOperationException case above, for the type added
-        // alongside it. SpnegoFilterConfig raises IllegalArgumentException for a missing
-        // spnego.krb5.conf, a missing spnego.login.conf and an exclude-dirs pattern it rejects, and
-        // those are server-side faults the operator needs the trace for. They are harmless here
-        // only because getAuthenticator() has already wrapped them in a plain SsoLoginException --
-        // a FessSystemException, so no longer the type being matched. Matching on the cause instead
-        // would find the nested IllegalArgumentException and silently demote every one of them.
-        addMockRequestHeader(Constants.AUTHZ_HEADER, "Negotiate YIIFoAYGKwYBBQUCoIIF");
-        final SpnegoAuthenticator authenticator = new SpnegoAuthenticator() {
-            @Override
-            protected org.codelibs.spnego.SpnegoAuthenticator getAuthenticator() {
-                throw new SsoLoginException("Failed to initialize SPNEGO.",
-                        new IllegalArgumentException("Must specify a username and password or a keyTab."));
-            }
-        };
-        final SsoLoginException e = assertThrows(SsoLoginException.class, authenticator::getLoginCredential);
-        assertFalse(e instanceof SsoStateException);
     }
 
     @Test
