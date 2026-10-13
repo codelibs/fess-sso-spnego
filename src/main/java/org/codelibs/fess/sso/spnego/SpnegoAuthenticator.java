@@ -125,6 +125,9 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
     /** Upper bound on the length of a client-supplied value embedded in a log message. */
     protected static final int MAX_LOGGED_REALM_LENGTH = 64;
 
+    /** Upper bound on the length of the initialization failure message written to the log. */
+    protected static final int MAX_LOGGED_FAILURE_LENGTH = 200;
+
     /** The longest Basic user name that is throttled rather than refused, as POST /api/v2/auth/login allows. */
     protected static final int MAX_BASIC_USER_LENGTH = 100;
 
@@ -189,13 +192,16 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
      * is disposed of once the settings change, so a handshake still running on it may fail and has
      * to be retried by the client. A rebuild that fails leaves no authenticator behind: the old
      * one no longer matches the settings, and the JVM-wide Kerberos and JAAS configuration it
-     * depends on now points at the new files. The next login tries again.
+     * depends on now points at the new files. The next login tries again. The failure is thrown as
+     * a {@link SsoStateException}, which the caller logs as one line: every anonymous request to
+     * the SSO endpoint repeats the attempt while the settings stay broken, so a stack trace per
+     * request would let a client fill the log. The stack trace is logged at debug level.
      *
      * Only the keys are compared. A change to the content of krb5.conf, the login configuration or
      * a keytab that leaves every key as it was is not detected and still needs a restart.
      *
      * @return The configured SPNEGO authenticator instance
-     * @throws SsoLoginException if SPNEGO initialization fails
+     * @throws SsoStateException if SPNEGO initialization fails
      */
     protected org.codelibs.spnego.SpnegoAuthenticator getAuthenticator() {
         final Map<String, String> settings = getAuthenticatorSettings();
@@ -224,7 +230,11 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
                 warnInsecureSettings(spnegoConfig);
                 return created;
             } catch (final Exception e) {
-                throw new SsoLoginException("Failed to initialize SPNEGO.", e);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Failed to initialize SPNEGO.", e);
+                }
+                throw new SsoStateException("Failed to initialize SPNEGO: " + e.getClass().getName() + ": "
+                        + (e.getMessage() == null ? "" : sanitizeForLog(e.getMessage(), MAX_LOGGED_FAILURE_LENGTH)), e);
             }
         }
     }
@@ -337,6 +347,10 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
                     logger.debug("principal={}", principal);
                 }
             } catch (final Exception e) {
+                if (e instanceof SsoStateException) {
+                    // getAuthenticator() failed: already a one-line refusal, not to be wrapped again.
+                    throw (SsoStateException) e;
+                }
                 final String msg = "Failed to process Authorization Header: " + maskAuthzHeader(request.getHeader(Constants.AUTHZ_HEADER));
                 if (logger.isDebugEnabled()) {
                     // Carries the exception, so the stack trace a refusal no longer writes at warn
@@ -543,8 +557,8 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
      * still logged at warn level for every refusal. The trace itself remains at debug level.
      *
      * <p>A genuine fault of this server cannot arrive as any of the three. Initialization failures
-     * are wrapped by {@link #getAuthenticator()} in a plain {@code SsoLoginException}, which is a
-     * {@code FessSystemException} and therefore none of these types, and it keeps its stack trace.
+     * are thrown by {@link #getAuthenticator()} as a {@code SsoStateException}, which is none of
+     * these types and is passed on as it is; its stack trace is logged at debug level.
      *
      * @param e the exception the handshake failed with
      * @return true when the client determined the failure
@@ -674,7 +688,18 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
      * @return a value safe to embed in a log message
      */
     protected static String sanitizeForLog(final String value) {
-        final String bounded = value.length() > MAX_LOGGED_REALM_LENGTH ? value.substring(0, MAX_LOGGED_REALM_LENGTH) + "..." : value;
+        return sanitizeForLog(value, MAX_LOGGED_REALM_LENGTH);
+    }
+
+    /**
+     * Bounds a value to the given length and strips its control characters.
+     *
+     * @param value the value
+     * @param maxLength the length above which the value is cut
+     * @return a value safe to embed in a log message
+     */
+    protected static String sanitizeForLog(final String value, final int maxLength) {
+        final String bounded = value.length() > maxLength ? value.substring(0, maxLength) + "..." : value;
         return LOG_UNSAFE_PATTERN.matcher(bounded).replaceAll("?");
     }
 
