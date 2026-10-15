@@ -4,13 +4,13 @@
 	<artifactId>fess-sso-spnego</artifactId>
 	<packaging>jar</packaging>
 	<name>SPNEGO SSO Plugin</name>
-	<version>15.9.0-SNAPSHOT</version>
+	<version>15.9.0</version>
 	<description>SPNEGO/Kerberos single sign-on for Fess: the authenticator behind sso.type=spnego.</description>
 	<scm>
 		<connection>scm:git:git@github.com:codelibs/fess-sso-spnego.git</connection>
 		<developerConnection>scm:git:git@github.com:codelibs/fess-sso-spnego.git</developerConnection>
 		<url>https://github.com/codelibs/fess-sso-spnego</url>
-		<tag>HEAD</tag>
+		<tag>fess-sso-spnego-15.9.0</tag>
 	</scm>
 	<parent>
 		<groupId>org.codelibs.fess</groupId>
