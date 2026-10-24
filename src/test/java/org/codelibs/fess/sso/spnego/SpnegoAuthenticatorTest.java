@@ -259,6 +259,27 @@ public class SpnegoAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_basicFailure_spellingsOfOneAccountShareTheAllowance() {
+        final List<String> failures = wireBasicThrottle(100, 2);
+        try {
+            final SpnegoAuthenticator authenticator = authenticatorFrom("192.0.2.1");
+            final HttpServletRequest request = requestWithAuthz(basic("carol:wrong"));
+            authenticator.throttleBasicAttempt(request, "carol");
+            authenticator.recordBasicFailure(request, "carol");
+            authenticator.throttleBasicAttempt(request, "CAROL@EXAMPLE.TEST");
+            authenticator.recordBasicFailure(request, "CAROL@EXAMPLE.TEST");
+            // The allowance of the account is used up whichever way the name is written.
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "Carol"));
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "EXAMPLE\\carol"));
+            assertThrows(SsoStateException.class, () -> authenticator.throttleBasicAttempt(request, "carol@other.test"));
+            // A different account is unaffected.
+            authenticator.throttleBasicAttempt(request, "dave");
+        } finally {
+            ComponentUtil.setFessConfig(null);
+        }
+    }
+
+    @Test
     public void test_basicAttempts_areBoundedPerAddress() {
         wireBasicThrottle(3, 100);
         try {

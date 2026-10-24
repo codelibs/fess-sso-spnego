@@ -23,6 +23,7 @@ import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -516,12 +517,26 @@ public class SpnegoAuthenticator implements SsoAuthenticator {
     /**
      * Builds the user-scope key in the (address, user name) form the v2 login uses.
      *
+     * <p>The directory takes {@code alice}, {@code ALICE}, {@code alice@REALM} and {@code DOMAIN\alice} for
+     * one account, so the key reduces the name to that account: no domain prefix (up to the first
+     * backslash, as the Kerberos login does), no realm suffix, lower case. Otherwise each spelling would
+     * get an allowance of its own and the per-account limit would be a limit per spelling.
+     *
      * @param clientIp the client address
      * @param user the user name
      * @return the key
      */
     protected static String basicUserKey(final String clientIp, final String user) {
-        return clientIp + '\0' + user;
+        String account = user;
+        final int domainEnd = account.indexOf('\\');
+        if (domainEnd >= 0) {
+            account = account.substring(domainEnd + 1);
+        }
+        final int realmStart = account.indexOf('@');
+        if (realmStart >= 0) {
+            account = account.substring(0, realmStart);
+        }
+        return clientIp + '\0' + account.toLowerCase(Locale.ROOT);
     }
 
     /**
